@@ -1,0 +1,10 @@
+﻿.venv/
+env/
+__pycache__/
+data_cache/
+nltk_data/
+.cache/
+*.log
+docs/*.pdf
+docs/*.pptx
+docs/*.zip
