@@ -1,17 +1,16 @@
-# app/retriever.py
+from __future__ import annotations
 
 import nltk
 
-# Ensure required tokenizers are present (one-time download if missing)
-try:
-    nltk.data.find("tokenizers/punkt_tab")
-except LookupError:
-    nltk.download("punkt_tab")
-
-try:
-    nltk.data.find("tokenizers/punkt")
-except LookupError:
-    nltk.download("punkt")
+# Ensure punkt is available (silently skip if offline and already present)
+for pkg in ["punkt", "punkt_tab"]:
+    try:
+        nltk.data.find(f"tokenizers/{pkg}")
+    except LookupError:
+        try:
+            nltk.download(pkg, quiet=True)
+        except Exception:
+            pass
 
 from typing import List, Tuple, Dict
 import numpy as np
@@ -26,7 +25,7 @@ from app.config import (
     EMBEDDING_MODEL, RERANKER_MODEL, MIN_SIM_THRESHOLD
 )
 
-# --- Consistent Chroma client/collection (match ingest.py) ---
+# --- Chroma ---
 def _client():
     return chromadb.PersistentClient(
         path=str(CACHE_DIR),
@@ -34,17 +33,19 @@ def _client():
     )
 
 def _collection():
-    client = _client()
+    c = _client()
     try:
-        return client.get_collection("local_rag")
+        return c.get_collection("local_rag")
     except Exception:
-        return client.create_collection("local_rag")
+        return c.create_collection("local_rag")
 
+# --- Globals ---
 _bm25 = None
 _bm25_docs: List[str] = []
 _bm25_meta: List[Dict] = []
 _embedder = None
 _reranker = None
+_reranker_ok = False
 
 def _embed():
     global _embedder
@@ -53,13 +54,17 @@ def _embed():
     return _embedder
 
 def _ranker():
-    global _reranker
-    if _reranker is None:
-        _reranker = CrossEncoder(RERANKER_MODEL)
+    global _reranker, _reranker_ok
+    if _reranker is None and not _reranker_ok:
+        try:
+            _reranker = CrossEncoder(RERANKER_MODEL)
+            _reranker_ok = True
+        except Exception:
+            _reranker = None
+            _reranker_ok = False
     return _reranker
 
 def _ensure_bm25():
-    """Build BM25 index if there are documents; otherwise leave _bm25 as None."""
     global _bm25, _bm25_docs, _bm25_meta
     if _bm25 is not None:
         return
@@ -75,7 +80,6 @@ def _ensure_bm25():
     _bm25_docs = docs
     _bm25_meta = metas
     tokens = [word_tokenize((t or "").lower()) for t in _bm25_docs]
-    # If everything tokenizes to empty, skip BM25
     if not any(tokens) or all(len(tok) == 0 for tok in tokens):
         _bm25 = None
         return
@@ -85,14 +89,12 @@ def hybrid_retrieve(query: str) -> List[Tuple[str, Dict, float]]:
     coll = _collection()
 
     # Vector search
-    qv = _embed().encode([query], normalize_embeddings=True)[0].tolist()  # Chroma wants list, not ndarray
+    qv = _embed().encode([query], normalize_embeddings=True)[0].tolist()
     res = coll.query(query_embeddings=[qv], n_results=TOPK_VECTOR)
-    vdocs = res.get("documents", [[]])
-    vmeta = res.get("metadatas", [[]])
-    vdocs = vdocs[0] if vdocs else []
-    vmeta = vmeta[0] if vmeta else []
+    vdocs = (res.get("documents") or [[]])[0]
+    vmeta = (res.get("metadatas") or [[]])[0]
 
-    # Optional BM25 branch
+    # Optional BM25
     _ensure_bm25()
     bdocs, bmeta = [], []
     if _bm25 is not None and len(_bm25_docs) > 0:
@@ -107,9 +109,8 @@ def hybrid_retrieve(query: str) -> List[Tuple[str, Dict, float]]:
     cand = list(zip(vdocs, vmeta)) + list(zip(bdocs, bmeta))
     seen, uniq = set(), []
     for t, m in cand:
-        # guard against None
         m = m or {}
-        key = (m.get("source"), m.get("chunk"), (t or "")[:48])
+        key = (m.get("source"), m.get("chunk"), (t or "")[:64])
         if key in seen:
             continue
         seen.add(key)
@@ -117,16 +118,21 @@ def hybrid_retrieve(query: str) -> List[Tuple[str, Dict, float]]:
     if not uniq:
         return []
 
-    # Rerank with cross-encoder
-    pairs = [[query, t] for t, _ in uniq]
-    sc = _ranker().predict(pairs)  # np.ndarray of scores
+    # Rerank if possible
+    ce = _ranker()
+    if ce is not None:
+        try:
+            pairs = [[query, t] for t, _ in uniq]
+            sc = ce.predict(pairs)  # np.ndarray
+        except Exception:
+            sc = np.linspace(0.2, 0.8, num=len(uniq))
+    else:
+        # heuristic: prefer vector half, then bm25 half
+        sc = np.linspace(0.51, 0.71, num=len(uniq))
 
+    # Top K & normalize
     ranked = sorted(zip(uniq, sc), key=lambda x: x[1], reverse=True)[:TOPK_RERANK]
-
-    # Robust normalization (fix the single-item -> 1.0 case)
     raw = np.array([r for _, r in ranked], dtype=float)
-    if raw.size == 0:
-        return []
     if raw.size == 1:
         norm = np.array([1.0], dtype=float)
     else:
