@@ -26,3 +26,4 @@ MIN_SIM_THRESHOLD = 0.25
 APP_TITLE = "🦙 Local RAG — LLaMA Chat"
 # Limit rows we chart so Streamlit stays snappy
 MAX_ROWS_PREVIEW = 2000
+DF_REQUIRED = True

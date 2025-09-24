@@ -6,10 +6,10 @@ from typing import Dict, Any, List, Tuple
 from .retriever import hybrid_retrieve, citations
 from .llm import chat_llm
 from .tools import (
-    aggregate,
+
     to_chart,
     load_full_tables_from_hits,
-    lookup_net_sales,
+
 )
 
 def _collect_tables(retrieved: List[Tuple[str, dict, float]]):
@@ -20,54 +20,148 @@ def _collect_tables(retrieved: List[Tuple[str, dict, float]]):
     """
     return load_full_tables_from_hits(retrieved)
 
+from .config import DF_REQUIRED
+from . import tools as T  # for answer_with_df_or_explain and other helpers
+# --- Lightweight intent router ---
+_CHITCHAT = {
+    "hi","hello","hey","salam","السلام","مرحبا","thanks","thank you",
+    "how are you","كيف الحال","حرّك","شو الأخبار","good morning","good evening",
+    "lol","haha","ok","okay"
+}
+_DATA_HINTS = {
+    # EN
+    "sum","total","average","avg","mean","median","max","min","count",
+    "between","from","to","range","vs","compare","trend",
+    "today","yesterday","this week","this month","last month","last year",
+    "month","daily","weekly","monthly",
+    "jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec",
+    "chart","plot","graph","line","bar","column","pie",
+    "sales","revenue","net","gross","cash","card","visa","mada","online","koinz","jahez","%",
+    # AR
+    "إجمالي","المجموع","مجموع","صافي","صافي المبيعات","المبيعات الصافية",
+    "إجمالي المبيعات","المبيعات الإجمالية","متوسط","المتوسط","أفضل","أسوأ",
+    "مقارنة","مقارن","ترند","اتجاه",
+    "اليوم","أمس","هذا الأسبوع","هذا الشهر","الشهر الماضي","السنة الماضية",
+    "شهري","أسبوعي","يومي","بالـيوم","حسب اليوم",
+    "يناير","فبراير","مارس","أبريل","ابريل","مايو","يونيو","يوليو",
+    "أغسطس","اغسطس","سبتمبر","أكتوبر","اكتوبر","نوفمبر","ديسمبر",
+    "مخطط","رسم","بياني","أعمدة","خط","دائري","باي","حصة","قنوات","قناة",
+    "نقد","كاش","بطاقة","مدى","أونلاين","اونلاين","جاهز","كوينز"
+}
+
+def _looks_like_chitchat(q: str) -> bool:
+    ql = (q or "").strip().lower()
+    if not ql:
+        return False
+    # very short or pure greeting/smalltalk
+    if len(ql.split()) <= 4 and any(tok in ql for tok in _CHITCHAT):
+        return True
+    # no digits/dates and no analysis verbs
+    if not any(ch.isdigit() for ch in ql) and not any(k in ql for k in _DATA_HINTS):
+        # still allow doc Q&A later — but this is likely chit-chat
+        return True
+    return False
+
+def _looks_like_data(q: str) -> bool:
+    ql = (q or "").lower()
+    # digits or % are إشارات قوية
+    if any(ch.isdigit() for ch in ql) or "%" in ql:
+        return True
+    return any(k in ql for k in _DATA_HINTS)
+
 def answer_query(query: str) -> Dict[str, Any]:
-    hits = hybrid_retrieve(query)
-    if not hits:
-        return {"text": "I don't know (no evidence).", "confidence": 0.0, "citations": ""}
+    q = (query or "").strip()
 
-    cits = citations(hits)
-    conf = sum(s for *_, s in hits) / max(len(hits), 1)
+    # 0) Chit-chat → general assistant
+    if _looks_like_chitchat(q):
+        out = chat_llm([
+            {"role": "system", "content": "You are a friendly, concise assistant."},
+            {"role": "user", "content": q}
+        ])
+        return {"text": out, "confidence": 1.0, "citations": ""}
 
-    # Load full tables for numeric work
-    tabs = _collect_tables(hits)
+    # 1) Retrieve context (tables/docs)
+    hits = hybrid_retrieve(q)
+    cits = citations(hits) if hits else ""
+    conf = (sum(s for *_, s in (hits or [])) / max(len(hits or []), 1)) if hits else 0.0
 
-    # 0) Direct point/range lookups (e.g., 'net sales on Jan 15', 'sum Jan 1-30')
-    looked = lookup_net_sales(query, tabs)
-    if looked is not None:
-        note, df = looked
-        return {
-            "text": f"{note}\n\n```\n{df.to_string(index=False)}\n```\n\nSources: {cits}",
+    # If nothing retrieved and it doesn't look like a data task → answer normally
+    if not hits and not _looks_like_data(q):
+        out = chat_llm([
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": q}
+        ])
+        return {"text": out, "confidence": 0.7, "citations": ""}
+
+    # 2) DF path (guarded by intent)
+    df_ans = None
+    if _looks_like_data(q) and hits:
+        try:
+            df_ans = T.answer_with_df(q, hits)  # -> (text, telemetry) | None
+        except Exception:
+            df_ans = None
+
+    # 3) Chart intent (independent, so charts show even if DF text path didn't)
+    ql = q.lower()
+    wants_chart = any(k in ql for k in ("chart","plot","graph","line","bar","column","pie","trend"))
+    chart_html = None
+    if wants_chart and hits:
+        try:
+            tabs = T.load_full_tables_from_hits(hits)
+            try:
+                tables_for_chart = T.select_tables_for_query(q, tabs) or tabs
+            except Exception:
+                tables_for_chart = tabs
+            chart_html = T.to_chart(q, tables_for_chart)
+        except Exception:
+            chart_html = None
+
+    # 4) If DF succeeded, return that (and prefer any chart from telemetry; else use chart_html)
+    if df_ans:
+        ans_text, telemetry = df_ans
+        resp: Dict[str, Any] = {
+            "text": f"{ans_text}\n\nSources: {cits}" if cits else ans_text,
             "confidence": conf,
             "citations": cits,
+            "meta": {"source": "dataframe", **(telemetry or {})},
         }
+        thtml = (telemetry or {}).get("chart_html") or chart_html
+        if thtml:
+            resp["chart_html"] = thtml
+        return resp
 
-    # 1) Aggregates (avg/mean)
-    agg = aggregate(query, tabs)
-    if agg is not None:
-        note, df = agg
-        return {
-            "text": f"{note}\n\n```\n{df.to_string(index=False)}\n```\n\nSources: {cits}",
-            "confidence": conf,
-            "citations": cits,
-        }
+    # 5) Enforce DF_REQUIRED only for data-intent questions with no usable tables
+    if DF_REQUIRED and _looks_like_data(q):
+        try:
+            tabs = T.load_full_tables_from_hits(hits or [])
+        except Exception:
+            tabs = []
+        if not tabs:
+            resp = {
+                "text": ("I didn’t find any tables to compute from.\n"
+                         "Upload or reference a sheet, or ask a non-tabular question."),
+                "confidence": conf,
+                "citations": cits,
+                "meta": {"source": "policy", "reason": "DF_REQUIRED_no_tables"},
+            }
+            if chart_html:
+                resp["chart_html"] = chart_html
+            return resp
 
-    # 2) Charts (optional)
-    chart = to_chart(query, tabs)
+    # 6) LLM fallback constrained to retrieved sources (doc-QA style)
+    ctx_blocks = []
+    for i, (t, m, _) in enumerate(hits or [], 1):
+        ctx_blocks.append(f"[Source {i}: {m.get('source','?')}]\n{t}")
+    prompt = f"Question: {q}\n\nUse ONLY these sources.\n\n" + "\n\n".join(ctx_blocks)
 
-    # 3) Fallback to LLM grounded in retrieved text
-    ctx = []
-    for i, (t, m, _) in enumerate(hits, 1):
-        ctx.append(f"[Source {i}: {m.get('source','?')}]\n{t}")
+    out = chat_llm([{"role": "user", "content": prompt}]).strip()
+    out = re.sub(r"\n{3,}", "\n\n", out)
 
-    prompt = f"Question: {query}\n\nUse ONLY these sources.\n\n" + "\n\n".join(ctx)
-    out = chat_llm([{"role": "user", "content": prompt}])
-    out = re.sub(r"\n{3,}", "\n\n", out).strip()
-
-    res = {
-        "text": f"{out}\n\nSources: {cits}",
+    res: Dict[str, Any] = {
+        "text": f"{out}\n\nSources: {cits}" if cits else out,
         "confidence": conf,
         "citations": cits,
     }
-    if chart:
-        res["chart_html"] = chart  # HTML string
+    if chart_html:
+        res["chart_html"] = chart_html
     return res
