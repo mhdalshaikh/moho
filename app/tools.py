@@ -803,12 +803,6 @@ def load_sales_workbook(path: str, sheet: str = "Data"):
     sd = SalesData(path, sheet=sheet)
     return sd.daily_net(), sd.totals_dict()
 # near other utils
-def _pretty_span(a, b):
-    # a,b are date objects with dummy year (1900/2000) — show as "Jan 1–7" or "Jan 1–Jan 7"
-    if a.month == b.month:
-        return f"{a.strftime('%b')} {a.day}–{b.day}"
-    return f"{a.strftime('%b')} {a.day}–{b.strftime('%b')} {b.day}"
-
 def _ensure_tables(tables=None, hits=None) -> list[tuple[pd.DataFrame, dict]]:
     """
     Return a non-empty list of (df, meta) by:
@@ -826,194 +820,155 @@ def _ensure_tables(tables=None, hits=None) -> list[tuple[pd.DataFrame, dict]]:
             out = _merge_tables_dedup(out, _load_all_parquet_tables(filter_sources=None))
     return out
 
+# --- totals per payment channel with sensible filtering ---
+def _channel_totals(df: pd.DataFrame, query: str | None = None) -> dict[str, float]:
+    """
+    Return {"Cash": 123.0, "Card": ..., ...} using detected channel columns.
+    - Honors channels explicitly mentioned in the query (cash/card/online/...), if any.
+    - Drops obviously-empty channels (all NaN/0).
+    """
+    if df is None or df.empty:
+        return {}
+
+    ch_cols = _map_channel_columns(df)  # {canon -> actual column name}
+    if not ch_cols:
+        return {}
+
+    ql = (query or "").lower()
+    mentioned = {ch for ch in _CHANNEL_SYNONYMS if re.search(rf"\b{ch}\b", ql)}
+    if mentioned:
+        ch_cols = {k: v for k, v in ch_cols.items() if k in mentioned} or ch_cols
+
+    totals: dict[str, float] = {}
+    for canon, col in ch_cols.items():
+        s = pd.to_numeric(df[col], errors="coerce")
+        if s.notna().any() and s.abs().sum() > 0:
+            totals[canon.capitalize()] = float(s.sum())
+
+    # If everything summed to 0, still return zeros for at least one channel so callers can decide.
+    if not totals and ch_cols:
+        for canon, col in ch_cols.items():
+            totals[canon.capitalize()] = float(pd.to_numeric(df[col], errors="coerce").sum())
+    return totals
+
+def _pretty_span(a, b):
+    # a,b are date objects (year ignored by caller)
+    return f"{a.month:02d}-{a.day:02d} to {b.month:02d}-{b.day:02d}"
+
+def _safe_first_numeric(df: pd.DataFrame) -> str | None:
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            return c
+    return None
+
 def to_chart(query: str,
              tables: list[tuple[pd.DataFrame, dict]] | None = None,
              hits=None) -> str | None:
     """
-    Chart generator:
-      • If query mentions 'pie': try to build a channel-share PIE from detected channel columns.
-        - If user also lists channels (cash vs card...), restrict to those when present.
-        - If only one non-zero slice exists, still draw a (trivial) pie.
-      • Else:
-        - If query names multiple channels: bar of those channel totals.
-        - Otherwise: line/bar of selected metric by day.
-    Returns HTML (fig.to_html) or None.
+    Render a Plotly chart that uses the SAME selection/aggregation as DF answers:
+      • If user asks for channels compare -> pie/bar of channel totals for the span.
+      • Otherwise -> bar/line of the chosen/derived metric by day for the span.
+
+    IMPORTANT: We first select tables with select_tables_for_query, then aggregate
+    with _compute_daily_metric(...). This keeps chart and text in sync.
     """
-    q = (query or "")
-    ql = q.lower()
+    ql = (query or "").lower()
 
-    # Accept either [(df, meta)...] or [df...] from callers
-    if tables and isinstance(tables, list) and len(tables) and isinstance(tables[0], pd.DataFrame):
-        tables = [(t, {}) for t in tables]
-
+    # Ensure we have tables
     tables = _ensure_tables(tables, hits)
     if not tables:
         return None
 
-    # Pick the most date-rich table
-    norm = [_maybe_flatten_columns(df) for (df, _) in tables if df is not None and not df.empty]
-    if not norm:
+    # Use the same month/year-aware selector as the DF path
+    picked = select_tables_for_query(query, tables) or tables
+    if not picked:
         return None
 
-    def _score(df):
-        dcol = _find_date_col(df)
-        if not dcol:
-            return 0
-        # prefer tables with many distinct days
-        return 10 + pd.to_datetime(df[dcol], errors="coerce").dt.date.nunique()
-
-    best = max(norm, key=_score)
-    dcol = _find_date_col(best)
-    if not dcol:
-        return None
-
-    raw = best.copy()
-    raw["_dt"] = pd.to_datetime(raw[dcol], errors="coerce")
-    raw = raw.dropna(subset=["_dt"])
-    if raw.empty:
-        return None
-
-    # Resolve time span (weeks, first/last N days, explicit ranges, month fallback)
-    _probe = (
-        raw.assign(_d=raw["_dt"].dt.date)
-           .groupby("_d", as_index=False).size()
-           .rename(columns={"_d": "date", "size": "val"})
-    )
-    span = _resolve_month_day_range(q, _probe)
-    span_label = "selected period"
-    if span:
-        a, b = span
-        md = raw["_dt"].dt.month * 100 + raw["_dt"].dt.day
-        raw = raw[md.between(a.month * 100 + a.day, b.month * 100 + b.day)]
-        if raw.empty:
+    # ----- Channels branch (cash vs card ... ) -----
+    if _wants_channel_compare(query):
+        # Build one raw frame (only from picked tables) with a valid date column
+        raws = []
+        for df, _meta in picked:
+            if df is None or df.empty:
+                continue
+            df2 = _maybe_flatten_columns(df)
+            dcol = _find_date_col(df2)
+            if not dcol:
+                continue
+            df2 = df2.copy()
+            df2["_dt"] = pd.to_datetime(df2[dcol], errors="coerce")
+            df2 = df2.dropna(subset=["_dt"])
+            if not df2.empty:
+                raws.append(df2)
+        if not raws:
             return None
-        span_label = _pretty_span(a, b)
 
-    # ---------------- PIE path ----------------
-    wants_pie = ("pie" in ql)
+        raw = pd.concat(raws, ignore_index=True)
 
-    if wants_pie:
-        # 1) Detect channel columns and totals
-        ch_cols = _map_channel_columns(raw)  # {canon: actual_col}
-        if ch_cols:
-            # If user listed channels (cash vs card...), keep only those mentioned when available
-            mentioned = {ch for ch in _CHANNEL_SYNONYMS if re.search(rf"\b{ch}\b", ql)}
-            keep = ch_cols
-            if mentioned:
-                keep = {k: v for k, v in ch_cols.items() if k in mentioned} or ch_cols
+        # Apply the same span logic used elsewhere
+        probe = (raw.assign(_d=raw["_dt"].dt.date)
+                    .groupby("_d", as_index=False).size()
+                    .rename(columns={"_d": "date", "size": "val"}))
+        span = _resolve_month_day_range(query, probe)
+        span_txt = "selected period"
+        if span:
+            a, b = span
+            md = raw["_dt"].dt.month * 100 + raw["_dt"].dt.day
+            raw = raw[md.between(a.month * 100 + a.day, b.month * 100 + b.day)]
+            if raw.empty:
+                return None
+            span_txt = _pretty_span(a, b)
 
-            totals = {
-                canon.capitalize(): float(pd.to_numeric(raw[col], errors="coerce").sum())
-                for canon, col in keep.items()
-            }
-            # If all-zero, try not excluding settlements (already handled in _channel_totals); reuse helper:
-            if all(abs(v) < 1e-12 for v in totals.values()):
-                totals = _channel_totals(raw, q)  # includes exclude/Other logic
+        totals = _channel_totals(raw, query)
+        if not totals:
+            return None
 
-            # If we have at least one slice, draw the pie
-            if totals:
-                dfp = pd.DataFrame({"Channel": list(totals.keys()),
-                                    "Total":   list(totals.values())})
-                # Keep non-zero first; if all zero, keep as-is to show trivial pie
-                if (dfp["Total"] != 0).any():
-                    dfp = dfp[dfp["Total"] != 0]
+        dfp = pd.DataFrame({"Channel": list(totals.keys()), "Total": list(totals.values())})
+        dfp = dfp.sort_values("Total", ascending=False)
 
-                # If after filtering nothing left, abort pie
-                if dfp.empty:
-                    # fall through to non-pie flow below
-                    pass
-                else:
-                    dfp = dfp.sort_values("Total", ascending=False)
-                    title = f"Channel share ({span_label})"
-                    fig = px.pie(dfp, names="Channel", values="Total", title=title)
-                    fig.update_traces(textposition="inside", textinfo="percent+label")
-                    # INLINE JS so it works offline / with CSP
-                    return fig.to_html(full_html=False, include_plotlyjs=True, config={"responsive": True})
-
-        # If we get here, we couldn't build a channel pie; try a metric pie over categories:
-        # Look for a categorical column with low cardinality to slice by (e.g., 'Department', 'Category')
-        cat_cols = [c for c in raw.columns
-                    if c not in (dcol, "_dt")
-                    and not pd.api.types.is_numeric_dtype(raw[c])
-                    and raw[c].nunique() <= 8  # small number of slices
-                    and raw[c].nunique() >= 1]
-        if cat_cols:
-            # pick the most "category-looking" column (few distinct values, not all unique)
-            cat_cols.sort(key=lambda c: raw[c].nunique())
-            cat = cat_cols[0]
-            # choose a numeric metric
-            mcol, phrase = _best_metric_column(raw, ql)
-            if mcol is None:
-                derived = _maybe_derive_metric(raw, phrase)
-                if derived is not None:
-                    vals = pd.to_numeric(derived, errors="coerce")
-                else:
-                    mcol = next((c for c in raw.columns if pd.api.types.is_numeric_dtype(raw[c])), None)
-                    if not mcol:
-                        # can’t build any pie; fall back below
-                        pass
-                    else:
-                        vals = pd.to_numeric(raw[mcol], errors="coerce")
-            else:
-                vals = pd.to_numeric(raw[mcol], errors="coerce")
-
-            if 'vals' in locals():
-                dfp = (
-                    pd.DataFrame({"cat": raw[cat], "val": vals})
-                    .dropna(subset=["cat", "val"])
-                    .groupby("cat", as_index=False)["val"].sum()
-                    .sort_values("val", ascending=False)
-                )
-                if not dfp.empty:
-                    title = f"{cat} share ({span_label})"
-                    fig = px.pie(dfp, names="cat", values="val", title=title)
-                    fig.update_traces(textposition="inside", textinfo="percent+label")
-                    return fig.to_html(full_html=False, include_plotlyjs=True, config={"responsive": True})
-        # If neither channel nor category pie is possible, we’ll fall through to non-pie flow.
-
-    # ---------------- Channels bar (no 'pie' but multiple channels mentioned) ----------------
-    wants_channels = _wants_channel_compare(q)
-    want_bar = ("bar" in ql) or ("column" in ql)
-
-    if wants_channels:
-        totals = _channel_totals(raw, q)
-        if totals:
-            dfp = pd.DataFrame({"Channel": list(totals.keys()), "Total": list(totals.values())})
-            dfp = dfp.sort_values("Total", ascending=False)
+        if (dfp["Total"] != 0).sum() >= MIN_NONZERO_FOR_PIE and "pie" in ql:
+            fig = px.pie(dfp, names="Channel", values="Total",
+                         title=f"{' / '.join(dfp['Channel'])} ({span_txt})")
+            fig.update_traces(textposition="inside", textinfo="percent+label")
+            return fig.to_html(full_html=False, include_plotlyjs=True, config={"responsive": True})
+        else:
             fig = px.bar(dfp, x="Channel", y="Total",
-                         title=f"Channel totals ({span_label})",
+                         title=f"Channel totals ({span_txt})",
                          labels={"Total": "Total", "Channel": "Channel"})
             return fig.to_html(full_html=False, include_plotlyjs=True, config={"responsive": True})
 
-    # ---------------- Metric-over-time (default) ----------------
-    mcol, phrase = _best_metric_column(raw, ql)
-    if mcol is None:
-        derived = _maybe_derive_metric(raw, phrase)
-        if derived is None:
-            mcol = _find_net_sales_col(raw) or next((c for c in raw.columns if pd.api.types.is_numeric_dtype(raw[c])), None)
-            if not mcol:
-                return None
-            vals = pd.to_numeric(raw[mcol], errors="coerce")
-        else:
-            vals = pd.to_numeric(derived, errors="coerce")
-    else:
-        vals = pd.to_numeric(raw[mcol], errors="coerce")
-
-    daily = (
-        pd.DataFrame({"x": raw["_dt"].dt.date, "y": vals})
-          .dropna(subset=["x","y"])
-          .groupby("x", as_index=False)["y"].sum()
-          .sort_values("x")
-    )
+    # ----- Metric-over-time branch (e.g., "gross Feb 10–20") -----
+    got = _compute_daily_metric(picked, query)
+    if not got:
+        return None
+    daily, phrase = got
     if daily.empty:
         return None
 
-    title = f"{phrase.title()} ({span_label})"
-    fig = px.bar(daily, x="x", y="y", title=title,
-                 labels={"x":"Date","y":phrase.title()}) if want_bar \
-          else px.line(daily, x="x", y="y", title=title,
-                       labels={"x":"Date","y":phrase.title()})
+    # Apply the exact same span filter as text answers
+    span = _resolve_month_day_range(query, daily)
+    span_txt = "selected period"
+    if span:
+        a, b = span
+        lo = a.month * 100 + a.day
+        hi = b.month * 100 + b.day
+        md = daily["date"].map(lambda d: d.month * 100 + d.day)
+        daily = daily[md.between(lo, hi)]
+        if daily.empty:
+            return None
+        span_txt = _pretty_span(a, b)
+
+    want_bar = ("bar" in ql) or ("column" in ql)
+    title = f"{phrase.title()} ({span_txt})"
+    fig = (px.bar(daily.sort_values("date"), x="date", y="val",
+                  title=title, labels={"date": "Date", "val": phrase.title()})
+           if want_bar else
+           px.line(daily.sort_values("date"), x="date", y="val",
+                   title=title, labels={"date": "Date", "val": phrase.title()}))
+
+    # Inline plotly.js so it renders everywhere
     return fig.to_html(full_html=False, include_plotlyjs=True, config={"responsive": True})
+
 
 
 # ===== Robust month + week/day-range parsing =====

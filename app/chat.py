@@ -71,17 +71,18 @@ def _looks_like_data(q: str) -> bool:
 
 def answer_query(query: str) -> Dict[str, Any]:
     q = (query or "").strip()
+    ql = q.lower()
 
     # 0) Chit-chat → general assistant
     if _looks_like_chitchat(q):
         out = chat_llm([
             {"role": "system", "content": "You are a friendly, concise assistant."},
-            {"role": "user", "content": q}
+            {"role": "user", "content": q},
         ])
         return {"text": out, "confidence": 1.0, "citations": ""}
 
     # 1) Retrieve context (tables/docs)
-    hits = hybrid_retrieve(q)
+    hits = hybrid_retrieve(q)  # -> iterable of (text, meta, score)
     cits = citations(hits) if hits else ""
     conf = (sum(s for *_, s in (hits or [])) / max(len(hits or []), 1)) if hits else 0.0
 
@@ -89,34 +90,28 @@ def answer_query(query: str) -> Dict[str, Any]:
     if not hits and not _looks_like_data(q):
         out = chat_llm([
             {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": q}
+            {"role": "user", "content": q},
         ])
         return {"text": out, "confidence": 0.7, "citations": ""}
 
-    # 2) DF path (guarded by intent)
+    # 2) DataFrame-first path (text answer)
     df_ans = None
     if _looks_like_data(q) and hits:
         try:
-            df_ans = T.answer_with_df(q, hits)  # -> (text, telemetry) | None
+            df_ans = T.answer_with_df(q, hits)  # -> (text, meta) | None
         except Exception:
-            df_ans = None
+            df_ans = None  # avoid breaking the UI
 
-    # 3) Chart intent (independent, so charts show even if DF text path didn't)
-    ql = q.lower()
-    wants_chart = any(k in ql for k in ("chart","plot","graph","line","bar","column","pie","trend"))
+    # 3) Chart intent (independent; shown whenever requested)
     chart_html = None
-    if wants_chart and hits:
-        try:
-            tabs = T.load_full_tables_from_hits(hits)
-            try:
-                tables_for_chart = T.select_tables_for_query(q, tabs) or tabs
-            except Exception:
-                tables_for_chart = tabs
-            chart_html = T.to_chart(q, tables_for_chart)
-        except Exception:
-            chart_html = None
+    try:
+        if T._wants_chart(q) and hits:
+            # let to_chart handle table selection from hits internally
+            chart_html = T.to_chart(q, hits=hits)
+    except Exception:
+        chart_html = None
 
-    # 4) If DF succeeded, return that (and prefer any chart from telemetry; else use chart_html)
+    # 4) If DF path succeeded, prefer it; attach chart if any
     if df_ans:
         ans_text, telemetry = df_ans
         resp: Dict[str, Any] = {
@@ -125,6 +120,7 @@ def answer_query(query: str) -> Dict[str, Any]:
             "citations": cits,
             "meta": {"source": "dataframe", **(telemetry or {})},
         }
+        # allow DF path to pass a chart via telemetry, else use the one we built
         thtml = (telemetry or {}).get("chart_html") or chart_html
         if thtml:
             resp["chart_html"] = thtml
